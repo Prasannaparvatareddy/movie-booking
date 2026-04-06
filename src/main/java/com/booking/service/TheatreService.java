@@ -10,6 +10,8 @@ import com.booking.repository.BookingRepository;
 import com.booking.repository.TheatreRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -26,12 +28,21 @@ public class TheatreService {
     private final TheatreRepository theatreRepository;
     private final BookingRepository bookingRepository;
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // READ — @Cacheable
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
-     * B2B: Full dashboard — total revenue, total seats sold, booking count, and per-show breakdown.
+     * Cache key: theatres::dashboard_1
+     * TTL: 5 minutes (configured in CacheConfig)
+     * Test: GET /api/v1/theatres/1/dashboard twice
+     *       First call  → ">>> DB HIT" in logs
+     *       Second call → no DB log (served from cache)
      */
+    @Cacheable(value = "theatres", key = "'dashboard_' + #theatreId")
     @Transactional(readOnly = true)
     public TheatreDashboardResponse getTheatreDashboard(Long theatreId) {
-        log.info("Fetching dashboard for theatreId: {}", theatreId);
+        log.info(">>> DB HIT — getTheatreDashboard({}) — cache key: theatres::dashboard_{}", theatreId, theatreId);
 
         Theatre theatre = theatreRepository.findById(theatreId)
                 .orElseThrow(() -> new ResourceNotFoundException("Theatre", theatreId));
@@ -39,7 +50,6 @@ public class TheatreService {
         BigDecimal totalRevenue = bookingRepository.getTotalRevenueByTheatre(theatreId);
         Integer totalSeatsSold = bookingRepository.getTotalSeatsSoldByTheatre(theatreId);
 
-        // Per-show revenue summary
         List<Object[]> rawSummary = bookingRepository.getShowRevenueSummaryByTheatre(theatreId);
         List<TheatreDashboardResponse.ShowRevenueSummary> showSummaries = rawSummary.stream()
                 .map(row -> TheatreDashboardResponse.ShowRevenueSummary.builder()
@@ -53,9 +63,7 @@ public class TheatreService {
                         .build())
                 .collect(Collectors.toList());
 
-        int totalBookings = showSummaries.stream()
-                .mapToInt(s -> s.getBookingCount().intValue())
-                .sum();
+        int totalBookings = showSummaries.stream().mapToInt(s -> s.getBookingCount().intValue()).sum();
 
         return TheatreDashboardResponse.builder()
                 .theatreId(theatre.getId())
@@ -69,66 +77,78 @@ public class TheatreService {
     }
 
     /**
-     * B2B: All bookings across all shows for a theatre.
+     * Cache key: theatres::bookings_1
+     * Test: GET /api/v1/theatres/1/bookings twice.
      */
+    @Cacheable(value = "theatres", key = "'bookings_' + #theatreId")
     @Transactional(readOnly = true)
     public List<TheatreBookingResponse> getAllBookingsForTheatre(Long theatreId) {
-        log.info("Fetching all bookings for theatreId: {}", theatreId);
+        log.info(">>> DB HIT — getAllBookingsForTheatre({}) — cache key: theatres::bookings_{}", theatreId, theatreId);
         validateTheatreExists(theatreId);
         return bookingRepository.findAllBookingsByTheatre(theatreId)
-                .stream()
-                .map(this::mapToTheatreBookingResponse)
-                .collect(Collectors.toList());
+                .stream().map(this::mapToTheatreBookingResponse).collect(Collectors.toList());
     }
 
     /**
-     * B2B: All bookings for a specific show in a theatre.
+     * Cache key: theatres::show_bookings_1_2
+     * Test: GET /api/v1/theatres/1/shows/2/bookings twice.
      */
+    @Cacheable(value = "theatres", key = "'show_bookings_' + #theatreId + '_' + #showId")
     @Transactional(readOnly = true)
     public List<TheatreBookingResponse> getBookingsForShow(Long theatreId, Long showId) {
-        log.info("Fetching bookings for theatreId: {}, showId: {}", theatreId, showId);
+        log.info(">>> DB HIT — getBookingsForShow({}, {}) — cache key: theatres::show_bookings_{}_{}", theatreId, showId, theatreId, showId);
         validateTheatreExists(theatreId);
         return bookingRepository.findBookingsByTheatreAndShow(theatreId, showId)
-                .stream()
-                .map(this::mapToTheatreBookingResponse)
-                .collect(Collectors.toList());
+                .stream().map(this::mapToTheatreBookingResponse).collect(Collectors.toList());
     }
 
     /**
-     * B2B: All bookings for a theatre on a specific date (useful for daily planning).
+     * Cache key: theatres::date_bookings_1_2025-07-01
+     * Test: GET /api/v1/theatres/1/bookings?date=2025-07-01 twice.
      */
+    @Cacheable(value = "theatres", key = "'date_bookings_' + #theatreId + '_' + #date")
     @Transactional(readOnly = true)
     public List<TheatreBookingResponse> getBookingsByDate(Long theatreId, LocalDate date) {
-        log.info("Fetching bookings for theatreId: {} on date: {}", theatreId, date);
+        log.info(">>> DB HIT — getBookingsByDate({}, {}) — cache key: theatres::date_bookings_{}_{}", theatreId, date, theatreId, date);
         validateTheatreExists(theatreId);
         return bookingRepository.findBookingsByTheatreAndDate(theatreId, date)
-                .stream()
-                .map(this::mapToTheatreBookingResponse)
-                .collect(Collectors.toList());
+                .stream().map(this::mapToTheatreBookingResponse).collect(Collectors.toList());
     }
 
     /**
-     * B2B: Revenue for a theatre on a specific date.
+     * Cache key: theatres::revenue_1_2025-07-01
+     * Test: GET /api/v1/theatres/1/revenue?date=2025-07-01 twice.
      */
+    @Cacheable(value = "theatres", key = "'revenue_' + #theatreId + '_' + #date")
     @Transactional(readOnly = true)
     public BigDecimal getRevenueByDate(Long theatreId, LocalDate date) {
+        log.info(">>> DB HIT — getRevenueByDate({}, {}) — cache key: theatres::revenue_{}_{}", theatreId, date, theatreId, date);
         validateTheatreExists(theatreId);
         return bookingRepository.getRevenueByTheatreAndDate(theatreId, date);
     }
 
-    // ── Private helpers ──────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // Evict theatre cache when bookings change (called from BookingService)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Called after a new booking or cancellation to refresh theatre data.
+     */
+    @CacheEvict(value = "theatres", allEntries = true)
+    public void evictTheatreCache() {
+        log.info(">>> CACHE EVICT — evictTheatreCache() — clearing ALL theatres cache entries");
+    }
+
+    // ─── Private helpers ──────────────────────────────────────────────────────
 
     private void validateTheatreExists(Long theatreId) {
-        if (!theatreRepository.existsById(theatreId)) {
+        if (!theatreRepository.existsById(theatreId))
             throw new ResourceNotFoundException("Theatre", theatreId);
-        }
     }
 
     private TheatreBookingResponse mapToTheatreBookingResponse(Booking booking) {
         List<String> seatNumbers = booking.getBookedSeats() != null
-                ? booking.getBookedSeats().stream()
-                    .map(BookedSeat::getSeatNumber)
-                    .collect(Collectors.toList())
+                ? booking.getBookedSeats().stream().map(BookedSeat::getSeatNumber).collect(Collectors.toList())
                 : List.of();
 
         return TheatreBookingResponse.builder()

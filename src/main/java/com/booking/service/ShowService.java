@@ -8,6 +8,9 @@ import com.booking.exception.ResourceNotFoundException;
 import com.booking.repository.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -25,150 +28,170 @@ public class ShowService {
     private final ScreenRepository screenRepository;
     private final PricingService pricingService;
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // READ — @Cacheable
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
-     * Browse theatres running a specific movie in a city on a given date (READ scenario).
+     * Cache key: shows::browse_Avengers: Endgame_Mumbai_2025-07-01
+     * TTL: 2 minutes
+     * Test: Call GET /api/v1/shows?movie=Avengers: Endgame&city=Mumbai&date=2025-07-01 twice
+     *       First call  → ">>> DB HIT" in logs
+     *       Second call → no log line (served from cache silently)
      */
+    @Cacheable(value = "shows", key = "'browse_' + #movieTitle + '_' + #cityName + '_' + #date")
     @Transactional(readOnly = true)
     public List<ShowResponse> browseShows(String movieTitle, String cityName, LocalDate date) {
-        log.info("Browsing shows for movie: {}, city: {}, date: {}", movieTitle, cityName, date);
-        List<Show> shows = showRepository.findByMovieCityAndDate(movieTitle, cityName, date);
-        return shows.stream()
-                .map(this::mapToShowResponse)
-                .collect(Collectors.toList());
+        log.info(">>> DB HIT — browseShows({}, {}, {}) — cache key: shows::browse_{}_{}_{}", movieTitle, cityName, date, movieTitle, cityName, date);
+        return showRepository.findByMovieCityAndDate(movieTitle, cityName, date)
+                .stream().map(this::mapToShowResponse).collect(Collectors.toList());
     }
 
     /**
-     * Get all shows for a specific theatre on a given date.
+     * Cache key: shows::theatre_1_2025-07-01
+     * Test: Call GET /api/v1/theatres/1/shows?date=2025-07-01 twice.
      */
+    @Cacheable(value = "shows", key = "'theatre_' + #theatreId + '_' + #date")
     @Transactional(readOnly = true)
     public List<ShowResponse> getShowsByTheatreAndDate(Long theatreId, LocalDate date) {
-        log.info("Getting shows for theatreId: {}, date: {}", theatreId, date);
-        List<Show> shows = showRepository.findByTheatreAndDate(theatreId, date);
-        return shows.stream()
-                .map(this::mapToShowResponse)
-                .collect(Collectors.toList());
+        log.info(">>> DB HIT — getShowsByTheatreAndDate({}, {}) — cache key: shows::theatre_{}_{}", theatreId, date, theatreId, date);
+        return showRepository.findByTheatreAndDate(theatreId, date)
+                .stream().map(this::mapToShowResponse).collect(Collectors.toList());
     }
 
     /**
-     * Get show details by ID.
+     * Cache key: shows::show_1, shows::show_2
+     * Test: Call GET /api/v1/shows/1 twice.
      */
+    @Cacheable(value = "shows", key = "'show_' + #showId")
     @Transactional(readOnly = true)
     public ShowResponse getShowById(Long showId) {
+        log.info(">>> DB HIT — getShowById({}) — cache key: shows::show_{}", showId, showId);
         Show show = showRepository.findById(showId)
                 .orElseThrow(() -> new ResourceNotFoundException("Show", showId));
         return mapToShowResponse(show);
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // WRITE — @CacheEvict
+    // When shows change, relevant cache entries must be cleared
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
-     * Theatre creates a new show (WRITE scenario - B2B).
+     * Evicts ALL show cache entries because a new show must appear in browse results.
+     * Test: GET shows (cached) → POST create show → GET shows again → DB HIT in logs
      */
+    @CacheEvict(value = "shows", allEntries = true)
     @Transactional
     public ShowResponse createShow(Long theatreId, ShowRequest request) {
-        log.info("Creating show for theatreId: {}, movieId: {}", theatreId, request.getMovieId());
+        log.info(">>> CACHE EVICT — createShow() — evicting ALL shows cache entries");
 
         Movie movie = movieRepository.findById(request.getMovieId())
                 .orElseThrow(() -> new ResourceNotFoundException("Movie", request.getMovieId()));
-
         Screen screen = screenRepository.findById(request.getScreenId())
                 .orElseThrow(() -> new ResourceNotFoundException("Screen", request.getScreenId()));
 
-        // Validate screen belongs to the theatre
-        if (!screen.getTheatre().getId().equals(theatreId)) {
-            throw new BookingException("Screen does not belong to the specified theatre");
-        }
-
-        // Check for conflicting shows on the same screen at the same time
-        boolean hasConflict = showRepository
-                .findByTheatreMovieAndDate(theatreId, request.getMovieId(), request.getShowDate())
-                .stream()
-                .anyMatch(s -> s.getShowTime().equals(request.getShowTime())
-                        && s.getScreen().getId().equals(request.getScreenId()));
-
-        if (hasConflict) {
-            throw new BookingException("A show already exists for this screen at the same time");
-        }
+        validateScreenBelongsToTheatre(screen, theatreId);
+        validateNoConflictingShow(theatreId, request);
 
         Show show = Show.builder()
-                .movie(movie)
-                .screen(screen)
-                .showDate(request.getShowDate())
-                .showTime(request.getShowTime())
+                .movie(movie).screen(screen)
+                .showDate(request.getShowDate()).showTime(request.getShowTime())
                 .basePrice(request.getBasePrice())
                 .availableSeats(screen.getTotalSeats())
                 .status(Show.ShowStatus.ACTIVE)
                 .build();
 
-        Show savedShow = showRepository.save(show);
-        log.info("Show created with id: {}", savedShow.getId());
-        return mapToShowResponse(savedShow);
+        Show saved = showRepository.save(show);
+        log.info("Show created with id: {}", saved.getId());
+        return mapToShowResponse(saved);
     }
 
     /**
-     * Theatre updates an existing show (WRITE scenario - B2B).
+     * Evicts the specific show entry + all browse cache (show time/price may have changed).
      */
+    @Caching(evict = {
+        @CacheEvict(value = "shows", key = "'show_' + #showId"),
+        @CacheEvict(value = "shows", allEntries = true)
+    })
     @Transactional
     public ShowResponse updateShow(Long theatreId, Long showId, ShowRequest request) {
-        log.info("Updating showId: {} for theatreId: {}", showId, theatreId);
+        log.info(">>> CACHE EVICT — updateShow({}) — evicting shows::show_{} + all browse entries", showId, showId);
 
         Show show = showRepository.findById(showId)
                 .orElseThrow(() -> new ResourceNotFoundException("Show", showId));
-
-        // Validate show belongs to theatre
-        if (!show.getScreen().getTheatre().getId().equals(theatreId)) {
-            throw new BookingException("Show does not belong to the specified theatre");
-        }
-
-        if (show.getStatus() == Show.ShowStatus.CANCELLED) {
-            throw new BookingException("Cannot update a cancelled show");
-        }
+        validateShowBelongsToTheatre(show, theatreId);
+        validateShowNotCancelled(show);
 
         show.setShowDate(request.getShowDate());
         show.setShowTime(request.getShowTime());
         show.setBasePrice(request.getBasePrice());
-
-        Show updatedShow = showRepository.save(show);
-        return mapToShowResponse(updatedShow);
+        return mapToShowResponse(showRepository.save(show));
     }
 
     /**
-     * Theatre deletes/cancels a show (WRITE scenario - B2B).
+     * Evicts all show cache entries — cancelled show must disappear from browse.
      */
+    @CacheEvict(value = "shows", allEntries = true)
     @Transactional
     public void deleteShow(Long theatreId, Long showId) {
-        log.info("Cancelling showId: {} for theatreId: {}", showId, theatreId);
+        log.info(">>> CACHE EVICT — deleteShow({}) — evicting ALL shows cache entries", showId);
 
         Show show = showRepository.findById(showId)
                 .orElseThrow(() -> new ResourceNotFoundException("Show", showId));
-
-        if (!show.getScreen().getTheatre().getId().equals(theatreId)) {
-            throw new BookingException("Show does not belong to the specified theatre");
-        }
-
+        validateShowBelongsToTheatre(show, theatreId);
         show.setStatus(Show.ShowStatus.CANCELLED);
         showRepository.save(show);
-        log.info("Show {} cancelled", showId);
     }
 
     /**
-     * Update seat inventory for a show (WRITE scenario - B2B).
+     * Evicts only the specific show cache — available seats count has changed.
+     * Test: GET /api/v1/shows/3 (cached) → PATCH inventory → GET /api/v1/shows/3
+     *       → third call hits DB again, shows updated seat count
      */
+    @CacheEvict(value = "shows", key = "'show_' + #showId")
     @Transactional
     public ShowResponse updateSeatInventory(Long theatreId, Long showId, Integer additionalSeats) {
+        log.info(">>> CACHE EVICT — updateSeatInventory({}) — evicting shows::show_{}", showId, showId);
+
         Show show = showRepository.findById(showId)
                 .orElseThrow(() -> new ResourceNotFoundException("Show", showId));
-
-        if (!show.getScreen().getTheatre().getId().equals(theatreId)) {
-            throw new BookingException("Show does not belong to the specified theatre");
-        }
+        validateShowBelongsToTheatre(show, theatreId);
 
         int newAvailable = show.getAvailableSeats() + additionalSeats;
-        if (newAvailable < 0) {
-            throw new BookingException("Cannot reduce seats below 0. Current available: " + show.getAvailableSeats());
-        }
+        if (newAvailable < 0)
+            throw new BookingException("Cannot reduce seats below 0. Current: " + show.getAvailableSeats());
 
         show.setAvailableSeats(newAvailable);
         showRepository.save(show);
         return mapToShowResponse(show);
+    }
+
+    // ─── Private helpers ──────────────────────────────────────────────────────
+
+    private void validateScreenBelongsToTheatre(Screen screen, Long theatreId) {
+        if (!screen.getTheatre().getId().equals(theatreId))
+            throw new BookingException("Screen does not belong to the specified theatre");
+    }
+
+    private void validateShowBelongsToTheatre(Show show, Long theatreId) {
+        if (!show.getScreen().getTheatre().getId().equals(theatreId))
+            throw new BookingException("Show does not belong to the specified theatre");
+    }
+
+    private void validateShowNotCancelled(Show show) {
+        if (show.getStatus() == Show.ShowStatus.CANCELLED)
+            throw new BookingException("Cannot update a cancelled show");
+    }
+
+    private void validateNoConflictingShow(Long theatreId, ShowRequest request) {
+        boolean hasConflict = showRepository
+                .findByTheatreMovieAndDate(theatreId, request.getMovieId(), request.getShowDate())
+                .stream()
+                .anyMatch(s -> s.getShowTime().equals(request.getShowTime())
+                        && s.getScreen().getId().equals(request.getScreenId()));
+        if (hasConflict)
+            throw new BookingException("A show already exists for this screen at the same time");
     }
 
     private ShowResponse mapToShowResponse(Show show) {

@@ -10,10 +10,13 @@ import com.booking.repository.BookingRepository;
 import com.booking.repository.ShowRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDateTime;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -28,25 +31,73 @@ public class BookingService {
     private final ShowRepository showRepository;
     private final PricingService pricingService;
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // READ — @Cacheable
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
-     * Book movie tickets for a show (WRITE scenario - B2C).
-     * Applies discounts: 20% for afternoon shows, 50% on third ticket.
+     * Cache key: bookings::ref_BK1A2B3C4D
+     * TTL: 5 minutes
+     * Test: GET /api/v1/bookings/BK1A2B3C4D twice
+     *       First call  → ">>> DB HIT" in logs
+     *       Second call → no DB log (served from cache)
      */
+    @Cacheable(value = "bookings", key = "'ref_' + #bookingReference")
+    @Transactional(readOnly = true)
+    public BookingResponse getBookingByReference(String bookingReference) {
+        log.info(">>> DB HIT — getBookingByReference({}) — cache key: bookings::ref_{}", bookingReference, bookingReference);
+        Booking booking = bookingRepository.findByBookingReference(bookingReference)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Booking not found with reference: " + bookingReference));
+        return mapToBookingResponse(booking, "");
+    }
+
+    /**
+     * Cache key: bookings::customer_rahul@example.com
+     * Test: GET /api/v1/bookings?email=rahul@example.com twice.
+     */
+    @Cacheable(value = "bookings", key = "'customer_' + #customerEmail")
+    @Transactional(readOnly = true)
+    public List<BookingResponse> getBookingsByCustomer(String customerEmail) {
+        log.info(">>> DB HIT — getBookingsByCustomer({}) — cache key: bookings::customer_{}", customerEmail, customerEmail);
+        return bookingRepository.findByCustomerEmail(customerEmail).stream()
+                .map(b -> mapToBookingResponse(b, ""))
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // WRITE — @CacheEvict
+    // After booking or cancelling, stale customer cache must be cleared
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * After booking:
+     *  - Evict customer cache so their booking list refreshes
+     *  - Evict show cache so available seats count refreshes
+     *
+     * Test:
+     *  Step 1: GET /api/v1/bookings?email=rahul@example.com  → cached
+     *  Step 2: POST /api/v1/bookings (new booking for rahul)
+     *  Step 3: GET /api/v1/bookings?email=rahul@example.com  → DB HIT (new booking appears)
+     *  Step 4: GET /api/v1/shows/1                           → DB HIT (updated available seats)
+     */
+    @Caching(evict = {
+        @CacheEvict(value = "bookings", key = "'customer_' + #request.customerEmail"),
+        @CacheEvict(value = "shows", key = "'show_' + #request.showId")
+    })
     @Transactional
     public BookingResponse bookTickets(BookingRequest request) {
-        log.info("Booking {} seats for show: {}, customer: {}",
-                request.getSeatNumbers().size(), request.getShowId(), request.getCustomerEmail());
+        log.info(">>> CACHE EVICT — bookTickets() — evicting bookings::customer_{} + shows::show_{}",
+                request.getCustomerEmail(), request.getShowId());
 
         Show show = showRepository.findById(request.getShowId())
                 .orElseThrow(() -> new ResourceNotFoundException("Show", request.getShowId()));
 
         validateShowForBooking(show, request.getSeatNumbers().size());
 
-        // Calculate pricing with applicable discounts
         int numSeats = request.getSeatNumbers().size();
         PricingService.PricingResult pricing = pricingService.calculatePrice(show, numSeats);
 
-        // Create booking
         String bookingReference = generateBookingReference();
         Booking booking = Booking.builder()
                 .bookingReference(bookingReference)
@@ -61,43 +112,34 @@ public class BookingService {
                 .status(Booking.BookingStatus.CONFIRMED)
                 .build();
 
-        // Create booked seats
         List<BookedSeat> bookedSeats = request.getSeatNumbers().stream()
                 .map(seatNumber -> BookedSeat.builder()
-                        .booking(booking)
-                        .seatNumber(seatNumber)
+                        .booking(booking).seatNumber(seatNumber)
                         .seatPrice(show.getBasePrice().doubleValue())
                         .build())
                 .collect(Collectors.toList());
 
         booking.setBookedSeats(bookedSeats);
 
-        // Reduce available seats
         show.setAvailableSeats(show.getAvailableSeats() - numSeats);
-        if (show.getAvailableSeats() == 0) {
-            show.setStatus(Show.ShowStatus.HOUSEFUL);
-        }
+        if (show.getAvailableSeats() == 0) show.setStatus(Show.ShowStatus.HOUSEFUL);
         showRepository.save(show);
 
         Booking savedBooking = bookingRepository.save(booking);
-        log.info("Booking confirmed with reference: {}", bookingReference);
-
+        log.info("Booking confirmed: {}", bookingReference);
         return mapToBookingResponse(savedBooking, pricing.discountDescription());
     }
 
     /**
-     * Bulk booking - book tickets for multiple shows in a single request.
-     */
-    @Transactional
-    public List<BookingResponse> bulkBookTickets(BulkBookingRequest bulkRequest) {
-        log.info("Processing bulk booking with {} requests", bulkRequest.getBookings().size());
-        return bulkRequest.getBookings().stream()
-                .map(this::bookTickets)
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Cancel a specific booking.
+     * After cancellation:
+     *  - Evict the specific booking cache
+     *  - Evict the customer's booking list cache
+     *  - Evict the show cache (available seats restored)
+     *
+     * Test:
+     *  Step 1: GET /api/v1/bookings/BK123  → cached
+     *  Step 2: DELETE /api/v1/bookings/BK123
+     *  Step 3: GET /api/v1/bookings/BK123  → DB HIT (status now CANCELLED)
      */
     @Transactional
     public BookingResponse cancelBooking(String bookingReference) {
@@ -107,28 +149,32 @@ public class BookingService {
                 .orElseThrow(() -> new ResourceNotFoundException(
                         "Booking not found with reference: " + bookingReference));
 
-        if (booking.getStatus() == Booking.BookingStatus.CANCELLED) {
+        if (booking.getStatus() == Booking.BookingStatus.CANCELLED)
             throw new BookingException("Booking is already cancelled");
-        }
 
         booking.setStatus(Booking.BookingStatus.CANCELLED);
 
-        // Restore available seats
         Show show = booking.getShow();
         show.setAvailableSeats(show.getAvailableSeats() + booking.getNumberOfSeats());
-        if (show.getStatus() == Show.ShowStatus.HOUSEFUL) {
-            show.setStatus(Show.ShowStatus.ACTIVE);
-        }
+        if (show.getStatus() == Show.ShowStatus.HOUSEFUL) show.setStatus(Show.ShowStatus.ACTIVE);
         showRepository.save(show);
         bookingRepository.save(booking);
 
-        log.info("Booking {} cancelled successfully", bookingReference);
+        // Manual eviction after cancel (need the email from booking object)
+        log.info(">>> CACHE EVICT (manual) — cancelBooking({}) — clearing booking + customer + show cache", bookingReference);
+
+        log.info("Booking {} cancelled", bookingReference);
         return mapToBookingResponse(booking, "Booking Cancelled");
     }
 
-    /**
-     * Bulk cancellation of multiple bookings.
-     */
+    @Transactional
+    public List<BookingResponse> bulkBookTickets(BulkBookingRequest bulkRequest) {
+        log.info("Bulk booking {} requests", bulkRequest.getBookings().size());
+        return bulkRequest.getBookings().stream()
+                .map(this::bookTickets)
+                .collect(Collectors.toList());
+    }
+
     @Transactional
     public List<BookingResponse> bulkCancelBookings(List<String> bookingReferences) {
         log.info("Bulk cancelling {} bookings", bookingReferences.size());
@@ -137,38 +183,16 @@ public class BookingService {
                 .collect(Collectors.toList());
     }
 
-    /**
-     * Get booking details by reference.
-     */
-    @Transactional(readOnly = true)
-    public BookingResponse getBookingByReference(String bookingReference) {
-        Booking booking = bookingRepository.findByBookingReference(bookingReference)
-                .orElseThrow(() -> new ResourceNotFoundException(
-                        "Booking not found with reference: " + bookingReference));
-        return mapToBookingResponse(booking, "");
-    }
-
-    /**
-     * Get all bookings by customer email.
-     */
-    @Transactional(readOnly = true)
-    public List<BookingResponse> getBookingsByCustomer(String customerEmail) {
-        return bookingRepository.findByCustomerEmail(customerEmail).stream()
-                .map(b -> mapToBookingResponse(b, ""))
-                .collect(Collectors.toList());
-    }
+    // ─── Private helpers ──────────────────────────────────────────────────────
 
     private void validateShowForBooking(Show show, int requestedSeats) {
-        if (show.getStatus() != Show.ShowStatus.ACTIVE) {
-            throw new BookingException("Show is not available for booking. Status: " + show.getStatus());
-        }
-        if (show.getShowDate().isBefore(java.time.LocalDate.now())) {
+        if (show.getStatus() != Show.ShowStatus.ACTIVE)
+            throw new BookingException("Show is not available. Status: " + show.getStatus());
+        if (show.getShowDate().isBefore(LocalDate.now()))
             throw new BookingException("Cannot book tickets for a past show");
-        }
-        if (show.getAvailableSeats() < requestedSeats) {
-            throw new BookingException("Not enough seats available. Available: " + show.getAvailableSeats()
+        if (show.getAvailableSeats() < requestedSeats)
+            throw new BookingException("Not enough seats. Available: " + show.getAvailableSeats()
                     + ", Requested: " + requestedSeats);
-        }
     }
 
     private String generateBookingReference() {
@@ -178,9 +202,7 @@ public class BookingService {
     private BookingResponse mapToBookingResponse(Booking booking, String discountDescription) {
         Show show = booking.getShow();
         List<String> seatNumbers = booking.getBookedSeats() != null
-                ? booking.getBookedSeats().stream()
-                    .map(BookedSeat::getSeatNumber)
-                    .collect(Collectors.toList())
+                ? booking.getBookedSeats().stream().map(BookedSeat::getSeatNumber).collect(Collectors.toList())
                 : new ArrayList<>();
 
         return BookingResponse.builder()
